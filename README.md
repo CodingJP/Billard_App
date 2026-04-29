@@ -2,7 +2,7 @@
 
 Webplattform fuer Billardspieler mit:
 
-- Registrierung nur mit Secret-Code aus `.env`
+- Registrierung nur mit Secret-Code aus `.env` für kleine Teams
 - Login/Logout
 - Rangliste auf Basis bestaetigter Spiele
 - Wettkaempfe erstellen und beitreten
