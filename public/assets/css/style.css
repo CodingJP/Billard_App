@@ -18,10 +18,14 @@
 
 body {
   margin: 0;
-  font-family: 'Space Grotesk', sans-serif;
+  font-family: "Space Grotesk", sans-serif;
   color: var(--ink);
   background:
-    radial-gradient(circle at 15% 5%, rgba(200, 121, 61, 0.25), transparent 36%),
+    radial-gradient(
+      circle at 15% 5%,
+      rgba(200, 121, 61, 0.25),
+      transparent 36%
+    ),
     radial-gradient(circle at 90% 0%, rgba(31, 75, 63, 0.18), transparent 44%),
     linear-gradient(150deg, #f7f3eb 0%, #ebe2d1 100%);
   min-height: 100vh;
@@ -34,7 +38,11 @@ body {
   width: 320px;
   height: 320px;
   border-radius: 40% 60% 56% 44%;
-  background: linear-gradient(130deg, rgba(47, 111, 93, 0.33), rgba(200, 121, 61, 0.33));
+  background: linear-gradient(
+    130deg,
+    rgba(47, 111, 93, 0.33),
+    rgba(200, 121, 61, 0.33)
+  );
   filter: blur(6px);
   z-index: -1;
   animation: drift 12s ease-in-out infinite;
@@ -42,8 +50,12 @@ body {
 
 @keyframes drift {
   0%,
-  100% { transform: translateY(0) rotate(0deg); }
-  50% { transform: translateY(-18px) rotate(4deg); }
+  100% {
+    transform: translateY(0) rotate(0deg);
+  }
+  50% {
+    transform: translateY(-18px) rotate(4deg);
+  }
 }
 
 .hero {
@@ -115,7 +127,9 @@ body {
   padding: 0.45rem 0.95rem;
   font-weight: 700;
   background: rgba(255, 255, 255, 0.82);
-  transition: transform 0.16s ease, background-color 0.16s ease;
+  transition:
+    transform 0.16s ease,
+    background-color 0.16s ease;
 }
 
 .main-nav a:hover {
@@ -205,7 +219,9 @@ button {
   color: #fff;
   border: 0;
   font-weight: 700;
-  transition: transform 0.15s ease, filter 0.15s ease;
+  transition:
+    transform 0.15s ease,
+    filter 0.15s ease;
 }
 
 button:hover {
@@ -373,7 +389,11 @@ td {
 .quick-link {
   text-decoration: none;
   color: var(--ink);
-  background: linear-gradient(145deg, rgba(255, 255, 255, 0.96), rgba(244, 237, 224, 0.88));
+  background: linear-gradient(
+    145deg,
+    rgba(255, 255, 255, 0.96),
+    rgba(244, 237, 224, 0.88)
+  );
   border: 1px solid rgba(31, 75, 63, 0.18);
   border-radius: 14px;
   padding: 0.95rem;
@@ -444,4 +464,168 @@ td {
     flex-direction: column;
     align-items: flex-start;
   }
+}
+
+/* ─── Nav logout & push button ─── */
+.nav-logout-form {
+  display: inline-flex;
+  align-items: center;
+  margin: 0;
+}
+.nav-logout {
+  font-size: 0.85rem;
+  padding: 0.3rem 0.8rem;
+}
+.nav-push {
+  font-size: 0.85rem;
+  padding: 0.3rem 0.8rem;
+}
+
+/* ─── Nav badge ─── */
+.nav-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 700;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+
+/* ─── Leaderboard self-highlight ─── */
+.row-self td {
+  background: rgba(31, 75, 63, 0.09);
+  font-weight: 600;
+}
+
+/* ─── Player link ─── */
+.player-link {
+  color: var(--brand-soft);
+  text-decoration: none;
+  font-weight: 500;
+}
+.player-link:hover {
+  text-decoration: underline;
+}
+
+/* ─── H2H comparison ─── */
+.h2h-header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+}
+.h2h-players {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.h2h-player {
+  text-align: center;
+  font-weight: 700;
+  font-size: 1.1rem;
+}
+.h2h-score {
+  font-size: 2rem;
+  font-weight: 700;
+  color: var(--brand);
+  padding: 0 0.5rem;
+}
+.h2h-vs {
+  color: var(--ink);
+  opacity: 0.5;
+  font-size: 0.9rem;
+}
+
+/* ─── Competition admin section ─── */
+.competition-admin {
+  border-top: 2px solid rgba(31, 75, 63, 0.15);
+  padding-top: 1rem;
+  margin-top: 1rem;
+}
+.competition-admin h3 {
+  color: var(--brand);
+}
+
+/* ─── Invite banner ─── */
+.invite-banner {
+  background: linear-gradient(
+    135deg,
+    rgba(200, 121, 61, 0.12),
+    rgba(31, 75, 63, 0.08)
+  );
+  border: 1px solid rgba(200, 121, 61, 0.3);
+  border-radius: var(--radius);
+  padding: 1rem 1.2rem;
+  margin-bottom: 1rem;
+}
+.invite-banner p {
+  margin: 0 0 0.5rem;
+  font-weight: 500;
+}
+
+/* ─── Pagination ─── */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}
+.pagination a,
+.pagination span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 36px;
+  height: 36px;
+  padding: 0 0.6rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  text-decoration: none;
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid rgba(0, 0, 0, 0.1);
+}
+.pagination span.current {
+  background: var(--brand);
+  color: #fff;
+  border-color: var(--brand);
+  font-weight: 700;
+}
+.pagination-info {
+  text-align: center;
+  font-size: 0.85rem;
+  opacity: 0.7;
+  margin-top: 0.4rem;
+}
+
+/* ─── Small button variant ─── */
+.btn-sm {
+  font-size: 0.8rem;
+  padding: 0.25rem 0.6rem;
+}
+
+/* ─── Danger pill (loss/rejection) ─── */
+.pill.danger {
+  background: rgba(180, 46, 46, 0.12);
+  color: var(--error);
+}
+.pill.draw {
+  background: rgba(100, 100, 100, 0.1);
+  color: #555;
+}
+.pill.win {
+  background: rgba(31, 106, 58, 0.12);
+  color: var(--success);
 }

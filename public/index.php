@@ -4,17 +4,19 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../src/auth.php';
 require_once __DIR__ . '/../src/helpers.php';
+require_once __DIR__ . '/../src/csrf.php';
+require_once __DIR__ . '/../src/push.php';
 
 function avatarUrl(?string $path): string
 {
-    if (!$path) {
-        return 'assets/icons/icon-192.svg';
-    }
-
-    return $path;
+    return $path ?: 'assets/icons/icon-192.svg';
 }
 
 $action = $_POST['action'] ?? null;
+
+if ($action !== null) {
+    verifyCsrfToken();
+}
 
 if ($action === 'register') {
     try {
@@ -49,25 +51,66 @@ if ($action === 'logout') {
 if ($action === 'create_competition') {
     requireLogin();
 
-    $name = trim($_POST['name'] ?? '');
-    $startDate = trim($_POST['start_date'] ?? '');
-    $status = trim($_POST['status'] ?? 'planned');
+    $name        = trim($_POST['name'] ?? '');
+    $description = trim($_POST['description'] ?? '');
+    $startDate   = trim($_POST['start_date'] ?? '');
+    $status      = trim($_POST['status'] ?? 'planned');
+    $joinMode    = trim($_POST['join_mode'] ?? 'open');
 
     if ($name === '' || $startDate === '') {
         flash('error', 'Bitte Name und Startdatum angeben.');
         redirect('index.php?page=competitions');
     }
 
-    $stmt = db()->prepare('INSERT INTO competitions (name, start_date, status, created_by) VALUES (:name, :start_date, :status, :created_by)');
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $startDate)) {
+        flash('error', 'UngÃ¼ltiges Startdatum.');
+        redirect('index.php?page=competitions');
+    }
+
+    $stmt = db()->prepare(
+        'INSERT INTO competitions (name, description, start_date, status, join_mode, created_by)
+         VALUES (:name, :description, :start_date, :status, :join_mode, :created_by)'
+    );
     $stmt->execute([
-        'name' => $name,
-        'start_date' => $startDate,
-        'status' => in_array($status, ['planned', 'active', 'finished'], true) ? $status : 'planned',
-        'created_by' => currentUserId(),
+        'name'        => $name,
+        'description' => $description !== '' ? $description : null,
+        'start_date'  => $startDate,
+        'status'      => in_array($status, ['planned', 'active', 'finished'], true) ? $status : 'planned',
+        'join_mode'   => in_array($joinMode, ['open', 'invite'], true) ? $joinMode : 'open',
+        'created_by'  => currentUserId(),
     ]);
 
-    flash('success', 'Wettkampf wurde erstellt.');
+    $compId = (int)db()->lastInsertId();
+    db()->prepare('INSERT IGNORE INTO competition_players (competition_id, user_id) VALUES (:cid, :uid)')
+        ->execute(['cid' => $compId, 'uid' => currentUserId()]);
+
+    flash('success', 'Wettkampf wurde erstellt. Du wurdest automatisch eingetragen.');
     redirect('index.php?page=competitions');
+}
+
+if ($action === 'update_competition_status') {
+    requireLogin();
+
+    $competitionId = (int)($_POST['competition_id'] ?? 0);
+    $newStatus     = trim($_POST['status'] ?? '');
+
+    if (!in_array($newStatus, ['planned', 'active', 'finished'], true)) {
+        flash('error', 'UngÃ¼ltiger Status.');
+        redirect('index.php?page=competitions&competition_id=' . $competitionId);
+    }
+
+    $check = db()->prepare('SELECT id FROM competitions WHERE id = :id AND created_by = :uid LIMIT 1');
+    $check->execute(['id' => $competitionId, 'uid' => currentUserId()]);
+    if (!$check->fetch()) {
+        flash('error', 'Keine Berechtigung zum Ã„ndern dieses Wettkampfs.');
+        redirect('index.php?page=competitions');
+    }
+
+    db()->prepare('UPDATE competitions SET status = :status WHERE id = :id')
+        ->execute(['status' => $newStatus, 'id' => $competitionId]);
+
+    flash('success', 'Wettkampf-Status aktualisiert.');
+    redirect('index.php?page=competitions&competition_id=' . $competitionId);
 }
 
 if ($action === 'join_competition') {
@@ -75,37 +118,105 @@ if ($action === 'join_competition') {
 
     $competitionId = (int)($_POST['competition_id'] ?? 0);
     if ($competitionId <= 0) {
-        flash('error', 'Ungültiger Wettkampf.');
+        flash('error', 'UngÃ¼ltiger Wettkampf.');
         redirect('index.php?page=competitions');
     }
 
-    $stmt = db()->prepare('INSERT IGNORE INTO competition_players (competition_id, user_id) VALUES (:competition_id, :user_id)');
-    $stmt->execute([
-        'competition_id' => $competitionId,
-        'user_id' => currentUserId(),
-    ]);
+    $compStmt = db()->prepare('SELECT join_mode, created_by FROM competitions WHERE id = :id LIMIT 1');
+    $compStmt->execute(['id' => $competitionId]);
+    $comp = $compStmt->fetch();
+
+    if (!$comp) {
+        flash('error', 'Wettkampf nicht gefunden.');
+        redirect('index.php?page=competitions');
+    }
+
+    if ($comp['join_mode'] === 'invite') {
+        $invStmt = db()->prepare(
+            "SELECT id FROM competition_invitations WHERE competition_id = :cid AND user_id = :uid AND status = 'pending' LIMIT 1"
+        );
+        $invStmt->execute(['cid' => $competitionId, 'uid' => currentUserId()]);
+        if (!$invStmt->fetch()) {
+            flash('error', 'Dieser Wettkampf ist nur auf Einladung zugÃ¤nglich.');
+            redirect('index.php?page=competitions');
+        }
+        db()->prepare("UPDATE competition_invitations SET status = 'accepted' WHERE competition_id = :cid AND user_id = :uid")
+            ->execute(['cid' => $competitionId, 'uid' => currentUserId()]);
+    }
+
+    db()->prepare('INSERT IGNORE INTO competition_players (competition_id, user_id) VALUES (:competition_id, :user_id)')
+        ->execute(['competition_id' => $competitionId, 'user_id' => currentUserId()]);
 
     flash('success', 'Du bist dem Wettkampf beigetreten.');
     redirect('index.php?page=competitions');
 }
 
+if ($action === 'leave_competition') {
+    requireLogin();
+
+    $competitionId = (int)($_POST['competition_id'] ?? 0);
+
+    $check = db()->prepare('SELECT id FROM competitions WHERE id = :id AND created_by = :uid LIMIT 1');
+    $check->execute(['id' => $competitionId, 'uid' => currentUserId()]);
+    if ($check->fetch()) {
+        flash('error', 'Als Ersteller kannst du den Wettkampf nicht verlassen. Setze ihn auf "Beendet".');
+        redirect('index.php?page=competitions');
+    }
+
+    db()->prepare('DELETE FROM competition_players WHERE competition_id = :cid AND user_id = :uid')
+        ->execute(['cid' => $competitionId, 'uid' => currentUserId()]);
+
+    flash('success', 'Du hast den Wettkampf verlassen.');
+    redirect('index.php?page=competitions');
+}
+
+if ($action === 'invite_to_competition') {
+    requireLogin();
+
+    $competitionId = (int)($_POST['competition_id'] ?? 0);
+    $targetId      = (int)($_POST['target_user_id'] ?? 0);
+
+    $check = db()->prepare('SELECT id FROM competitions WHERE id = :id AND created_by = :uid LIMIT 1');
+    $check->execute(['id' => $competitionId, 'uid' => currentUserId()]);
+    if (!$check->fetch()) {
+        flash('error', 'Keine Berechtigung oder Wettkampf nicht gefunden.');
+        redirect('index.php?page=competitions&competition_id=' . $competitionId);
+    }
+
+    if ($targetId <= 0) {
+        flash('error', 'UngÃ¼ltiger Spieler.');
+        redirect('index.php?page=competitions&competition_id=' . $competitionId);
+    }
+
+    db()->prepare(
+        'INSERT IGNORE INTO competition_invitations (competition_id, user_id, invited_by) VALUES (:cid, :uid, :by)'
+    )->execute(['cid' => $competitionId, 'uid' => $targetId, 'by' => currentUserId()]);
+
+    flash('success', 'Einladung wurde versendet.');
+    redirect('index.php?page=competitions&competition_id=' . $competitionId);
+}
+
 if ($action === 'report_game') {
     requireLogin();
 
-    $player1 = (int)($_POST['player1_id'] ?? 0);
-    $player2 = (int)($_POST['player2_id'] ?? 0);
-    $score1 = (int)($_POST['score_player1'] ?? 0);
-    $score2 = (int)($_POST['score_player2'] ?? 0);
+    $player1       = (int)($_POST['player1_id'] ?? 0);
+    $player2       = (int)($_POST['player2_id'] ?? 0);
+    $score1        = (int)($_POST['score_player1'] ?? 0);
+    $score2        = (int)($_POST['score_player2'] ?? 0);
     $competitionId = (int)($_POST['competition_id'] ?? 0);
-    $playedAt = trim($_POST['played_at'] ?? date('Y-m-d'));
+    $playedAt      = trim($_POST['played_at'] ?? date('Y-m-d'));
+
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $playedAt) || $playedAt > date('Y-m-d')) {
+        $playedAt = date('Y-m-d');
+    }
 
     if ($player1 <= 0 || $player2 <= 0 || $player1 === $player2) {
-        flash('error', 'Bitte zwei unterschiedliche Spieler waehlen.');
+        flash('error', 'Bitte zwei unterschiedliche Spieler wÃ¤hlen.');
         redirect('index.php?page=matches');
     }
 
-    if ($score1 === $score2) {
-        flash('error', 'Unentschieden ist aktuell nicht erlaubt.');
+    if ($score1 < 0 || $score2 < 0) {
+        flash('error', 'Punkte dÃ¼rfen nicht negativ sein.');
         redirect('index.php?page=matches');
     }
 
@@ -114,26 +225,30 @@ if ($action === 'report_game') {
         redirect('index.php?page=matches');
     }
 
-    $winnerId = $score1 > $score2 ? $player1 : $player2;
+    // Unentschieden erlaubt: winner_id bleibt NULL
+    $winnerId = $score1 !== $score2 ? ($score1 > $score2 ? $player1 : $player2) : null;
 
-    $stmt = db()->prepare('INSERT INTO games (
-        competition_id, player1_id, player2_id, score_player1, score_player2, winner_id, reported_by, played_at
-    ) VALUES (
-        :competition_id, :player1_id, :player2_id, :score_player1, :score_player2, :winner_id, :reported_by, :played_at
-    )');
-
+    $stmt = db()->prepare(
+        'INSERT INTO games
+         (competition_id, player1_id, player2_id, score_player1, score_player2, winner_id, reported_by, played_at)
+         VALUES
+         (:competition_id, :player1_id, :player2_id, :score_player1, :score_player2, :winner_id, :reported_by, :played_at)'
+    );
     $stmt->execute([
         'competition_id' => $competitionId > 0 ? $competitionId : null,
-        'player1_id' => $player1,
-        'player2_id' => $player2,
-        'score_player1' => $score1,
-        'score_player2' => $score2,
-        'winner_id' => $winnerId,
-        'reported_by' => currentUserId(),
-        'played_at' => $playedAt,
+        'player1_id'     => $player1,
+        'player2_id'     => $player2,
+        'score_player1'  => $score1,
+        'score_player2'  => $score2,
+        'winner_id'      => $winnerId,
+        'reported_by'    => currentUserId(),
+        'played_at'      => $playedAt,
     ]);
 
-    flash('success', 'Spiel wurde gemeldet und wartet auf Bestaetigung.');
+    $opponentId = currentUserId() === $player1 ? $player2 : $player1;
+    notifyUser($opponentId, 'SpielbestÃ¤tigung erforderlich', 'Ein gemeldetes Ergebnis wartet auf deine BestÃ¤tigung in der BillardLiga.');
+
+    flash('success', 'Spiel wurde gemeldet und wartet auf BestÃ¤tigung.');
     redirect('index.php?page=matches');
 }
 
@@ -159,12 +274,10 @@ if ($action === 'confirm_game') {
         redirect('index.php?page=matches');
     }
 
-    $update = db()->prepare('UPDATE games SET status = :status, confirmed_by = :confirmed_by WHERE id = :id');
-    $update->execute([
-        'status' => 'confirmed',
-        'confirmed_by' => $me,
-        'id' => $gameId,
-    ]);
+    db()->prepare('UPDATE games SET status = :status, confirmed_by = :confirmed_by WHERE id = :id')
+        ->execute(['status' => 'confirmed', 'confirmed_by' => $me, 'id' => $gameId]);
+
+    notifyUser((int)$game['reported_by'], 'Ergebnis bestÃ¤tigt âœ“', 'Dein eingetragenes Ergebnis wurde bestÃ¤tigt.');
 
     flash('success', 'Ergebnis wurde bestaetigt.');
     redirect('index.php?page=matches');
@@ -192,12 +305,8 @@ if ($action === 'reject_game') {
         redirect('index.php?page=matches');
     }
 
-    $update = db()->prepare('UPDATE games SET status = :status, confirmed_by = :confirmed_by WHERE id = :id');
-    $update->execute([
-        'status' => 'rejected',
-        'confirmed_by' => $me,
-        'id' => $gameId,
-    ]);
+    db()->prepare('UPDATE games SET status = :status, confirmed_by = :confirmed_by WHERE id = :id')
+        ->execute(['status' => 'rejected', 'confirmed_by' => $me, 'id' => $gameId]);
 
     flash('success', 'Ergebnis wurde abgelehnt.');
     redirect('index.php?page=matches');
@@ -238,7 +347,7 @@ if ($action === 'upload_avatar') {
 
     $uploadDirFs = __DIR__ . '/uploads/avatars';
     if (!is_dir($uploadDirFs)) {
-        mkdir($uploadDirFs, 0777, true);
+        mkdir($uploadDirFs, 0755, true);
     }
 
     if (!is_writable($uploadDirFs)) {
@@ -310,12 +419,10 @@ if ($action === 'send_friend_request') {
         redirect('index.php?page=friends');
     }
 
-    $insert = db()->prepare('INSERT INTO friendships (requester_id, addressee_id, status) VALUES (:requester, :addressee, :status)');
-    $insert->execute([
-        'requester' => $me,
-        'addressee' => $targetId,
-        'status' => 'pending',
-    ]);
+    db()->prepare('INSERT INTO friendships (requester_id, addressee_id, status) VALUES (:requester, :addressee, :status)')
+        ->execute(['requester' => $me, 'addressee' => $targetId, 'status' => 'pending']);
+
+    notifyUser($targetId, 'Neue Freundesanfrage', 'Du hast eine neue Freundesanfrage in der BillardLiga erhalten.');
 
     flash('success', 'Freundesanfrage gesendet.');
     redirect('index.php?page=friends');
@@ -378,40 +485,52 @@ if ($action === 'remove_friend') {
 
 $loggedIn = isLoggedIn();
 
-$allowedPages = ['auth', 'dashboard', 'matches', 'competitions', 'leaderboard', 'friends', 'profile'];
+$allowedPages = ['auth', 'dashboard', 'matches', 'competitions', 'leaderboard', 'friends', 'profile', 'h2h'];
 $page = $_GET['page'] ?? ($loggedIn ? 'dashboard' : 'auth');
 if (!in_array($page, $allowedPages, true)) {
     $page = $loggedIn ? 'dashboard' : 'auth';
 }
 
-$protectedPages = ['dashboard', 'matches', 'competitions', 'friends', 'profile'];
+$protectedPages = ['dashboard', 'matches', 'competitions', 'friends', 'profile', 'h2h'];
 if (!$loggedIn && in_array($page, $protectedPages, true)) {
     flash('error', 'Bitte zuerst anmelden.');
     redirect('index.php?page=auth');
 }
 
-$users = [];
-$competitions = [];
-$competitionStatusOverview = ['planned' => 0, 'active' => 0, 'finished' => 0, 'total' => 0];
-$selectedCompetitionId = isset($_GET['competition_id']) ? max(0, (int)$_GET['competition_id']) : 0;
-$selectedCompetition = null;
+$users                      = [];
+$competitions               = [];
+$competitionStatusOverview  = ['planned' => 0, 'active' => 0, 'finished' => 0, 'total' => 0];
+$selectedCompetitionId      = isset($_GET['competition_id']) ? max(0, (int)$_GET['competition_id']) : 0;
+$selectedCompetition        = null;
 $selectedCompetitionParticipants = [];
-$selectedCompetitionLeaderboard = [];
-$selectedCompetitionGames = [];
-$roundRobinPairings = [];
-$semiFinalPairings = [];
-$finalSuggestion = null;
-$myCompetitionIds = [];
-$leaderboard = [];
-$pendingConfirmations = [];
-$recentGames = [];
-$currentProfile = null;
-$friendSuggestions = [];
-$incomingFriendRequests = [];
-$outgoingFriendRequests = [];
-$friends = [];
-$friendIdsLookup = [];
-$friendsLeaderboard = [];
+$selectedCompetitionLeaderboard  = [];
+$selectedCompetitionGames        = [];
+$roundRobinPairings         = [];
+$semiFinalPairings          = [];
+$finalSuggestion            = null;
+$myCompetitionIds           = [];
+$myPendingInvitations       = [];
+$leaderboard                = [];
+$pendingConfirmations        = [];
+$recentGames                = [];
+$currentProfile             = null;
+$friendSuggestions          = [];
+$incomingFriendRequests     = [];
+$outgoingFriendRequests     = [];
+$friends                    = [];
+$friendIdsLookup            = [];
+$friendsLeaderboard         = [];
+$myStats                    = ['wins' => 0, 'losses' => 0, 'draws' => 0, 'games_played' => 0, 'win_rate' => 0.0];
+$myStreak                   = 0;
+$myBestOpponent             = null;
+$myRecentGames              = [];
+$opponent                   = null;
+$h2hGames                   = [];
+$h2hStats                   = ['my_wins' => 0, 'their_wins' => 0, 'draws' => 0, 'total' => 0];
+$h2hOpponents               = [];
+$gamesPerPage               = 20;
+$gamesPage                  = max(1, (int)($_GET['gp'] ?? 1));
+$gamesTotalPages            = 1;
 $dashboardStats = [
     'users' => 0,
     'competitions' => 0,
@@ -450,13 +569,16 @@ try {
             u.id,
             u.username,
             u.avatar_path,
-            SUM(CASE WHEN g.status = 'confirmed' AND g.winner_id = u.id THEN 3 ELSE 0 END) AS points,
+            SUM(CASE WHEN g.status = 'confirmed' AND g.winner_id = u.id THEN 3
+                     WHEN g.status = 'confirmed' AND g.winner_id IS NULL AND (g.player1_id = u.id OR g.player2_id = u.id) THEN 1
+                     ELSE 0 END) AS points,
             SUM(CASE WHEN g.status = 'confirmed' AND g.winner_id = u.id THEN 1 ELSE 0 END) AS wins,
             SUM(CASE WHEN g.status = 'confirmed' AND g.winner_id IS NOT NULL AND g.winner_id <> u.id AND (g.player1_id = u.id OR g.player2_id = u.id) THEN 1 ELSE 0 END) AS losses,
+            SUM(CASE WHEN g.status = 'confirmed' AND g.winner_id IS NULL AND (g.player1_id = u.id OR g.player2_id = u.id) THEN 1 ELSE 0 END) AS draws,
             SUM(CASE WHEN g.status = 'confirmed' AND (g.player1_id = u.id OR g.player2_id = u.id) THEN 1 ELSE 0 END) AS games_played
          FROM users u
          LEFT JOIN games g ON (g.player1_id = u.id OR g.player2_id = u.id)
-         GROUP BY u.id, u.username
+         GROUP BY u.id, u.username, u.avatar_path
          ORDER BY points DESC, wins DESC, u.username ASC"
     )->fetchAll();
 
@@ -625,9 +747,28 @@ try {
             'me3' => $me,
         ]);
         $pendingConfirmations = $stmt->fetchAll();
+
+        // Pending invitations
+        $invitationsStmt = db()->prepare(
+            "SELECT ci.competition_id, c.name AS competition_name, u.username AS invited_by_name
+             FROM competition_invitations ci
+             JOIN competitions c ON c.id = ci.competition_id
+             JOIN users u ON u.id = ci.invited_by
+             WHERE ci.user_id = :me AND ci.status = 'pending'
+             ORDER BY ci.created_at DESC"
+        );
+        $invitationsStmt->execute(['me' => $me]);
+        $myPendingInvitations = $invitationsStmt->fetchAll();
     }
 
-    $recentGames = db()->query(
+    // Paginated recent games (for matches page)
+    $totalGamesRow = db()->query("SELECT COUNT(*) AS cnt FROM games")->fetch();
+    $totalGames = (int)($totalGamesRow['cnt'] ?? 0);
+    $gamesTotalPages = max(1, (int)ceil($totalGames / $gamesPerPage));
+    $gamesPage = min($gamesPage, $gamesTotalPages);
+    $gamesOffset = ($gamesPage - 1) * $gamesPerPage;
+
+    $pgStmt = db()->prepare(
         "SELECT g.*, u1.username AS p1, u2.username AS p2, uw.username AS winner_name, c.name AS competition_name
          FROM games g
          JOIN users u1 ON u1.id = g.player1_id
@@ -635,8 +776,12 @@ try {
          LEFT JOIN users uw ON uw.id = g.winner_id
          LEFT JOIN competitions c ON c.id = g.competition_id
          ORDER BY g.created_at DESC
-         LIMIT 15"
-    )->fetchAll();
+         LIMIT :lim OFFSET :off"
+    );
+    $pgStmt->bindValue(':lim', $gamesPerPage, PDO::PARAM_INT);
+    $pgStmt->bindValue(':off', $gamesOffset, PDO::PARAM_INT);
+    $pgStmt->execute();
+    $recentGames = $pgStmt->fetchAll();
 
     $totals = db()->query(
         "SELECT
@@ -658,22 +803,152 @@ try {
             $leaderboard,
             static fn(array $row): bool => isset($friendIdsLookup[(int)$row['id']]) || (int)$row['id'] === $me
         ));
+
+        // Profile stats
+        if ($page === 'profile') {
+            $statsStmt = db()->prepare(
+                "SELECT
+                    SUM(CASE WHEN winner_id = :me THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN winner_id IS NOT NULL AND winner_id <> :me2 AND (player1_id = :me3 OR player2_id = :me4) THEN 1 ELSE 0 END) AS losses,
+                    SUM(CASE WHEN winner_id IS NULL AND (player1_id = :me5 OR player2_id = :me6) THEN 1 ELSE 0 END) AS draws,
+                    SUM(CASE WHEN player1_id = :me7 OR player2_id = :me8 THEN 1 ELSE 0 END) AS games_played
+                 FROM games
+                 WHERE status = 'confirmed' AND (player1_id = :me9 OR player2_id = :me10)"
+            );
+            $statsStmt->execute(array_fill_keys([':me', ':me2', ':me3', ':me4', ':me5', ':me6', ':me7', ':me8', ':me9', ':me10'], $me));
+            $statsRow = $statsStmt->fetch();
+            if ($statsRow) {
+                $gp = max(1, (int)$statsRow['games_played']);
+                $myStats = [
+                    'wins'         => (int)$statsRow['wins'],
+                    'losses'       => (int)$statsRow['losses'],
+                    'draws'        => (int)$statsRow['draws'],
+                    'games_played' => $gp,
+                    'win_rate'     => round((int)$statsRow['wins'] / $gp * 100, 1),
+                ];
+            }
+
+            // Current streak
+            $streakStmt = db()->prepare(
+                "SELECT winner_id, player1_id, player2_id FROM games
+                 WHERE status = 'confirmed' AND (player1_id = :me OR player2_id = :me2)
+                 ORDER BY played_at DESC, id DESC LIMIT 20"
+            );
+            $streakStmt->execute([':me' => $me, ':me2' => $me]);
+            $streakGames = $streakStmt->fetchAll();
+            $streak = 0;
+            $streakType = null;
+            foreach ($streakGames as $sg) {
+                $won  = (int)$sg['winner_id'] === $me;
+                $draw = $sg['winner_id'] === null;
+                $type = $won ? 'W' : ($draw ? 'D' : 'L');
+                if ($streakType === null) {
+                    $streakType = $type;
+                }
+                if ($type !== $streakType) {
+                    break;
+                }
+                $streak++;
+            }
+            $myStreak = $streakType === 'W' ? $streak : -$streak;
+
+            // Best opponent (most wins against)
+            $bestStmt = db()->prepare(
+                "SELECT u.id, u.username,
+                    SUM(CASE WHEN g.winner_id = :me THEN 1 ELSE 0 END) AS wins_against
+                 FROM games g
+                 JOIN users u ON u.id = CASE WHEN g.player1_id = :me2 THEN g.player2_id ELSE g.player1_id END
+                 WHERE g.status = 'confirmed' AND (g.player1_id = :me3 OR g.player2_id = :me4)
+                 GROUP BY u.id, u.username
+                 ORDER BY wins_against DESC, u.username ASC
+                 LIMIT 1"
+            );
+            $bestStmt->execute([':me' => $me, ':me2' => $me, ':me3' => $me, ':me4' => $me]);
+            $myBestOpponent = $bestStmt->fetch() ?: null;
+
+            // Recent 10 games
+            $recentStmt = db()->prepare(
+                "SELECT g.*, u1.username AS p1, u2.username AS p2, uw.username AS winner_name
+                 FROM games g
+                 JOIN users u1 ON u1.id = g.player1_id
+                 JOIN users u2 ON u2.id = g.player2_id
+                 LEFT JOIN users uw ON uw.id = g.winner_id
+                 WHERE g.status = 'confirmed' AND (g.player1_id = :me OR g.player2_id = :me2)
+                 ORDER BY g.played_at DESC, g.id DESC LIMIT 10"
+            );
+            $recentStmt->execute([':me' => $me, ':me2' => $me]);
+            $myRecentGames = $recentStmt->fetchAll();
+        }
+
+        // H2H data
+        if ($page === 'h2h') {
+            $opponentId = (int)($_GET['opponent_id'] ?? 0);
+            if ($opponentId > 0 && $opponentId !== $me) {
+                $oppStmt = db()->prepare('SELECT id, username, avatar_path FROM users WHERE id = :id LIMIT 1');
+                $oppStmt->execute([':id' => $opponentId]);
+                $opponent = $oppStmt->fetch() ?: null;
+
+                if ($opponent) {
+                    $h2hStmt = db()->prepare(
+                        "SELECT g.*, u1.username AS p1, u2.username AS p2
+                         FROM games g
+                         JOIN users u1 ON u1.id = g.player1_id
+                         JOIN users u2 ON u2.id = g.player2_id
+                         WHERE g.status = 'confirmed'
+                           AND ((g.player1_id = :me AND g.player2_id = :opp)
+                             OR (g.player1_id = :opp2 AND g.player2_id = :me2))
+                         ORDER BY g.played_at DESC, g.id DESC"
+                    );
+                    $h2hStmt->execute([':me' => $me, ':opp' => $opponentId, ':opp2' => $opponentId, ':me2' => $me]);
+                    $h2hGames = $h2hStmt->fetchAll();
+
+                    foreach ($h2hGames as $hg) {
+                        $h2hStats['total']++;
+                        if ($hg['winner_id'] === null) {
+                            $h2hStats['draws']++;
+                        } elseif ((int)$hg['winner_id'] === $me) {
+                            $h2hStats['my_wins']++;
+                        } else {
+                            $h2hStats['their_wins']++;
+                        }
+                    }
+                }
+            } else {
+                // List all opponents
+                $oppsStmt = db()->prepare(
+                    "SELECT u.id, u.username, COUNT(*) AS match_count
+                     FROM games g
+                     JOIN users u ON u.id = CASE WHEN g.player1_id = :me THEN g.player2_id ELSE g.player1_id END
+                     WHERE g.status = 'confirmed' AND (g.player1_id = :me2 OR g.player2_id = :me3)
+                     GROUP BY u.id, u.username
+                     ORDER BY match_count DESC, u.username ASC"
+                );
+                $oppsStmt->execute([':me' => $me, ':me2' => $me, ':me3' => $me]);
+                $h2hOpponents = $oppsStmt->fetchAll();
+            }
+        }
     }
 } catch (Throwable $e) {
     flash('error', 'Dashboard-Daten konnten nicht geladen werden. Bitte Seite neu laden.');
 }
 
 $flashes = consumeFlash();
-$cssVersion = (string)@filemtime(__DIR__ . '/assets/css/style.css');
-$jsVersion = (string)@filemtime(__DIR__ . '/assets/js/app.js');
+$cssVersion      = (string)@filemtime(__DIR__ . '/assets/css/style.css');
+$jsVersion       = (string)@filemtime(__DIR__ . '/assets/js/app.js');
 $manifestVersion = (string)@filemtime(__DIR__ . '/manifest.webmanifest');
+$vapidPublicKey  = (string)(getenv('VAPID_PUBLIC_KEY') ?: '');
 ?>
 <!DOCTYPE html>
 <html lang="de">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="theme-color" content="#1f4b3f">
+    <meta name="csrf-token" content="<?= esc(generateCsrfToken()) ?>">
+    <?php if ($vapidPublicKey !== ''): ?>
+        <meta name="vapid-public-key" content="<?= esc($vapidPublicKey) ?>">
+    <?php endif; ?>
     <title>BillardLiga</title>
     <link rel="manifest" href="manifest.webmanifest?v=<?= esc($manifestVersion) ?>">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -681,25 +956,20 @@ $manifestVersion = (string)@filemtime(__DIR__ . '/manifest.webmanifest');
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="assets/css/style.css?v=<?= esc($cssVersion) ?>">
 </head>
+
 <body>
     <div class="background-shape"></div>
     <header class="hero">
         <div>
             <p class="eyebrow">Community Plattform</p>
             <h1>BillardLiga</h1>
-            <p>Organisiere Wettkaempfe, melde Einzelspiele und bestaetige Ergebnisse fair durch den Gegenspieler.</p>
+            <p>Organisiere Wettk&auml;mpfe, melde Einzelspiele und best&auml;tige Ergebnisse fair durch den Gegenspieler.</p>
             <?php if ($loggedIn): ?>
                 <p class="user-badge">Eingeloggt als <?= esc((string)($_SESSION['username'] ?? '')) ?></p>
             <?php endif; ?>
         </div>
         <div class="hero-actions">
             <button id="install-pwa" hidden>Als App installieren</button>
-            <?php if ($loggedIn): ?>
-                <form method="post">
-                    <input type="hidden" name="action" value="logout">
-                    <button type="submit" class="secondary">Abmelden</button>
-                </form>
-            <?php endif; ?>
         </div>
     </header>
 
@@ -710,12 +980,29 @@ $manifestVersion = (string)@filemtime(__DIR__ . '/manifest.webmanifest');
             <?php endif; ?>
             <?php if ($loggedIn): ?>
                 <a href="index.php?page=dashboard" class="<?= $page === 'dashboard' ? 'active' : '' ?>">Dashboard</a>
-                <a href="index.php?page=matches" class="<?= $page === 'matches' ? 'active' : '' ?>">Einzelspiele</a>
-                <a href="index.php?page=competitions" class="<?= $page === 'competitions' ? 'active' : '' ?>">Wettkaempfe</a>
-                <a href="index.php?page=friends" class="<?= $page === 'friends' ? 'active' : '' ?>">Freunde</a>
+                <a href="index.php?page=matches" class="<?= $page === 'matches' ? 'active' : '' ?>">
+                    Einzelspiele<?php if (count($pendingConfirmations) > 0): ?><span class="nav-badge"><?= count($pendingConfirmations) ?></span><?php endif; ?>
+                </a>
+                <a href="index.php?page=competitions" class="<?= $page === 'competitions' ? 'active' : '' ?>">
+                    Wettkampf<?php if (count($myPendingInvitations) > 0): ?><span class="nav-badge"><?= count($myPendingInvitations) ?></span><?php endif; ?>
+                </a>
+                <a href="index.php?page=h2h" class="<?= $page === 'h2h' ? 'active' : '' ?>">H2H</a>
+                <a href="index.php?page=friends" class="<?= $page === 'friends' ? 'active' : '' ?>">
+                    Freunde<?php if (count($incomingFriendRequests) > 0): ?><span class="nav-badge"><?= count($incomingFriendRequests) ?></span><?php endif; ?>
+                </a>
                 <a href="index.php?page=profile" class="<?= $page === 'profile' ? 'active' : '' ?>">Profil</a>
             <?php endif; ?>
             <a href="index.php?page=leaderboard" class="<?= $page === 'leaderboard' ? 'active' : '' ?>">Rangliste</a>
+            <?php if ($loggedIn && $vapidPublicKey !== ''): ?>
+                <button id="enable-push" class="secondary nav-push" hidden>&#128276; Benachrichtigungen</button>
+            <?php endif; ?>
+            <?php if ($loggedIn): ?>
+                <form method="post" class="nav-logout-form">
+                    <?= csrfField() ?>
+                    <input type="hidden" name="action" value="logout">
+                    <button type="submit" class="secondary nav-logout">Abmelden</button>
+                </form>
+            <?php endif; ?>
         </div>
     </nav>
 
@@ -724,590 +1011,10 @@ $manifestVersion = (string)@filemtime(__DIR__ . '/manifest.webmanifest');
             <div class="flash <?= esc($flash['type']) ?>"><?= esc($flash['message']) ?></div>
         <?php endforeach; ?>
 
-        <?php if ($page === 'auth'): ?>
-            <?php if ($loggedIn): ?>
-                <section class="card wide">
-                    <h2>Du bist bereits angemeldet</h2>
-                    <p>Nutze das Menue oben, um zu Spielen, Wettkaempfen oder deiner Rangliste zu wechseln.</p>
-                </section>
-            <?php else: ?>
-            <section class="card">
-                <h2>Anmelden</h2>
-                <form method="post" class="form-stack">
-                    <input type="hidden" name="action" value="login">
-                    <label>Benutzername oder E-Mail
-                        <input type="text" name="username_or_email" required>
-                    </label>
-                    <label>Passwort
-                        <input type="password" name="password" required>
-                    </label>
-                    <button type="submit">Einloggen</button>
-                </form>
-            </section>
-
-            <section class="card">
-                <h2>Registrierung mit Secret-Code</h2>
-                <form method="post" class="form-stack">
-                    <input type="hidden" name="action" value="register">
-                    <label>Benutzername
-                        <input type="text" name="username" minlength="3" required>
-                    </label>
-                    <label>E-Mail
-                        <input type="email" name="email" required>
-                    </label>
-                    <label>Passwort
-                        <input type="password" name="password" minlength="8" required>
-                    </label>
-                    <label>Secret-Code
-                        <input type="text" name="secret_code" required>
-                    </label>
-                    <button type="submit">Account erstellen</button>
-                </form>
-            </section>
-            <?php endif; ?>
-        <?php endif; ?>
-
-        <?php if ($page === 'dashboard' && $loggedIn): ?>
-            <section class="card stat-card">
-                <p class="stat-label">Mitglieder</p>
-                <p class="metric"><?= (int)$dashboardStats['users'] ?></p>
-                <p class="stat-hint">Aktive Spieler in deiner Liga</p>
-            </section>
-            <section class="card stat-card">
-                <p class="stat-label">Wettkaempfe</p>
-                <p class="metric"><?= (int)$dashboardStats['competitions'] ?></p>
-                <p class="stat-hint">Laufende und geplante Formate</p>
-            </section>
-            <section class="card stat-card">
-                <p class="stat-label">Bestaetigte Spiele</p>
-                <p class="metric"><?= (int)$dashboardStats['confirmed_games'] ?></p>
-                <p class="stat-hint">Wertungen, die in die Rangliste eingehen</p>
-            </section>
-            <section class="card stat-card">
-                <p class="stat-label">Offene Bestaetigungen</p>
-                <p class="metric"><?= (int)$dashboardStats['pending'] ?></p>
-                <p class="stat-hint">Warten auf Gegenspieler-Freigabe</p>
-            </section>
-            <section class="card wide">
-                <h2>Schnellzugriff</h2>
-                <div class="quick-actions">
-                    <a href="index.php?page=matches" class="quick-link">Neues Einzelspiel eintragen</a>
-                    <a href="index.php?page=competitions" class="quick-link">Wettkampf erstellen oder beitreten</a>
-                    <a href="index.php?page=leaderboard" class="quick-link">Rangliste ansehen</a>
-                </div>
-            </section>
-            <section class="card wide">
-                <h2>Aktivitaet</h2>
-                <?php if (count($recentGames) === 0): ?>
-                    <p>Noch keine Spiele vorhanden. Trage dein erstes Match ueber Einzelspiele ein.</p>
-                <?php else: ?>
-                    <ul class="item-list">
-                        <?php foreach (array_slice($recentGames, 0, 5) as $game): ?>
-                            <li>
-                                <div>
-                                    <strong><?= esc($game['p1']) ?> <?= (int)$game['score_player1'] ?> : <?= (int)$game['score_player2'] ?> <?= esc($game['p2']) ?></strong>
-                                    <small>Status: <?= esc($game['status']) ?><?= $game['competition_name'] ? ' | ' . esc($game['competition_name']) : '' ?></small>
-                                </div>
-                            </li>
-                        <?php endforeach; ?>
-                    </ul>
-                <?php endif; ?>
-            </section>
-        <?php endif; ?>
-
-        <?php if ($page === 'matches' && $loggedIn): ?>
-            <section class="card wide">
-                <h2>Einzelspiel melden</h2>
-                <form method="post" class="form-grid">
-                    <input type="hidden" name="action" value="report_game">
-                    <label>Spieler 1
-                        <select name="player1_id" required>
-                            <option value="">Waehlen...</option>
-                            <?php foreach ($users as $user): ?>
-                                <option value="<?= (int)$user['id'] ?>"><?= esc($user['username']) ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </label>
-                    <label>Spieler 2
-                        <select name="player2_id" required>
-                            <option value="">Waehlen...</option>
-                            <?php foreach ($users as $user): ?>
-                                <option value="<?= (int)$user['id'] ?>"><?= esc($user['username']) ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </label>
-                    <label>Punkte Spieler 1
-                        <input type="number" name="score_player1" min="0" required>
-                    </label>
-                    <label>Punkte Spieler 2
-                        <input type="number" name="score_player2" min="0" required>
-                    </label>
-                    <label>Wettkampf (optional)
-                        <select name="competition_id">
-                            <option value="0">Kein Wettkampf</option>
-                            <?php foreach ($competitions as $competition): ?>
-                                <option value="<?= (int)$competition['id'] ?>"><?= esc($competition['name']) ?></option>
-                            <?php endforeach; ?>
-                        </select>
-                    </label>
-                    <label>Spieltag
-                        <input type="date" name="played_at" value="<?= esc(date('Y-m-d')) ?>" required>
-                    </label>
-                    <button type="submit">Ergebnis einreichen</button>
-                </form>
-            </section>
-
-            <section class="card">
-                <h2>Offene Bestaetigungen</h2>
-                <?php if (count($pendingConfirmations) === 0): ?>
-                    <p>Aktuell keine ausstehenden Ergebnis-Bestaetigungen.</p>
-                <?php else: ?>
-                    <ul class="item-list">
-                        <?php foreach ($pendingConfirmations as $game): ?>
-                            <li>
-                                <div>
-                                    <strong><?= esc($game['p1']) ?> <?= (int)$game['score_player1'] ?> : <?= (int)$game['score_player2'] ?> <?= esc($game['p2']) ?></strong>
-                                    <small>Gemeldet von <?= esc($game['reporter']) ?><?= $game['competition_name'] ? ' | ' . esc($game['competition_name']) : '' ?></small>
-                                </div>
-                                <div class="inline-actions">
-                                    <form method="post">
-                                        <input type="hidden" name="action" value="confirm_game">
-                                        <input type="hidden" name="game_id" value="<?= (int)$game['id'] ?>">
-                                        <button type="submit">Bestaetigen</button>
-                                    </form>
-                                    <form method="post">
-                                        <input type="hidden" name="action" value="reject_game">
-                                        <input type="hidden" name="game_id" value="<?= (int)$game['id'] ?>">
-                                        <button type="submit" class="secondary">Ablehnen</button>
-                                    </form>
-                                </div>
-                            </li>
-                        <?php endforeach; ?>
-                    </ul>
-                <?php endif; ?>
-            </section>
-        <?php endif; ?>
-
-        <?php if ($page === 'leaderboard'): ?>
-        <section class="card wide">
-            <h2>Rangliste</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th>#</th>
-                        <th>Spieler</th>
-                        <th>Beziehung</th>
-                        <th>Punkte</th>
-                        <th>Siege</th>
-                        <th>Niederlagen</th>
-                        <th>Spiele</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php foreach ($leaderboard as $index => $row): ?>
-                        <tr>
-                            <td><?= $index + 1 ?></td>
-                            <td><?= esc($row['username']) ?></td>
-                            <td>
-                                <?php if ($loggedIn && (int)$row['id'] === (int)currentUserId()): ?>
-                                    <span class="pill self">Du</span>
-                                <?php elseif ($loggedIn && isset($friendIdsLookup[(int)$row['id']])): ?>
-                                    <span class="pill friend">Freund</span>
-                                <?php else: ?>
-                                    <span class="pill neutral">Liga</span>
-                                <?php endif; ?>
-                            </td>
-                            <td><?= (int)$row['points'] ?></td>
-                            <td><?= (int)$row['wins'] ?></td>
-                            <td><?= (int)$row['losses'] ?></td>
-                            <td><?= (int)$row['games_played'] ?></td>
-                        </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-        </section>
-
-        <?php if ($loggedIn): ?>
-        <section class="card wide">
-            <h2>Freunde-Rangliste</h2>
-            <?php if (count($friendsLeaderboard) === 0): ?>
-                <p>Keine Freunde vorhanden. Fuege Freunde hinzu, um die separate Rangliste zu sehen.</p>
-            <?php else: ?>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>#</th>
-                            <th>Spieler</th>
-                            <th>Punkte</th>
-                            <th>Siege</th>
-                            <th>Niederlagen</th>
-                            <th>Spiele</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($friendsLeaderboard as $index => $row): ?>
-                            <tr>
-                                <td><?= $index + 1 ?></td>
-                                <td>
-                                    <?= esc($row['username']) ?>
-                                    <?php if ((int)$row['id'] === (int)currentUserId()): ?>
-                                        <span class="pill self">Du</span>
-                                    <?php endif; ?>
-                                </td>
-                                <td><?= (int)$row['points'] ?></td>
-                                <td><?= (int)$row['wins'] ?></td>
-                                <td><?= (int)$row['losses'] ?></td>
-                                <td><?= (int)$row['games_played'] ?></td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
-            <?php endif; ?>
-        </section>
-        <?php endif; ?>
-        <?php endif; ?>
-
-        <?php if ($page === 'competitions' && $loggedIn): ?>
-        <section class="card wide">
-            <h2>Wettkampf-Uebersicht</h2>
-            <div class="quick-actions">
-                <div class="quick-link quick-link-static">
-                    <div>
-                        <p class="stat-label">Gesamt</p>
-                        <p class="metric"><?= (int)$competitionStatusOverview['total'] ?></p>
-                    </div>
-                </div>
-                <div class="quick-link quick-link-static">
-                    <div>
-                        <p class="stat-label">Geplant</p>
-                        <p class="metric"><?= (int)$competitionStatusOverview['planned'] ?></p>
-                    </div>
-                </div>
-                <div class="quick-link quick-link-static">
-                    <div>
-                        <p class="stat-label">Aktiv</p>
-                        <p class="metric"><?= (int)$competitionStatusOverview['active'] ?></p>
-                    </div>
-                </div>
-            </div>
-        </section>
-
-        <section class="card">
-            <h2>Wettkampf erstellen</h2>
-            <form method="post" class="form-stack">
-                <input type="hidden" name="action" value="create_competition">
-                <label>Name
-                    <input type="text" name="name" required>
-                </label>
-                <label>Startdatum
-                    <input type="date" name="start_date" required>
-                </label>
-                <label>Status
-                    <select name="status">
-                        <option value="planned">Geplant</option>
-                        <option value="active">Aktiv</option>
-                        <option value="finished">Beendet</option>
-                    </select>
-                </label>
-                <button type="submit">Wettkampf speichern</button>
-            </form>
-        </section>
-
-        <section class="card">
-            <h2>Wettkaempfe</h2>
-            <?php if (count($competitions) === 0): ?>
-                <p>Noch keine Wettkaempfe vorhanden.</p>
-            <?php else: ?>
-                <ul class="item-list">
-                    <?php foreach ($competitions as $competition): ?>
-                        <li>
-                            <div>
-                                <strong><?= esc($competition['name']) ?></strong>
-                                <small>
-                                    <?= esc($competition['status']) ?> | Start: <?= esc($competition['start_date']) ?> | Von: <?= esc($competition['creator']) ?>
-                                    | Teilnehmer: <?= (int)$competition['participants_count'] ?>
-                                    | Bestaetigte Spiele: <?= (int)$competition['confirmed_games'] ?>
-                                </small>
-                            </div>
-                            <div class="inline-actions">
-                                <a class="button-link secondary" href="index.php?page=competitions&competition_id=<?= (int)$competition['id'] ?>">Auswertung</a>
-                                <?php if (!in_array((int)$competition['id'], $myCompetitionIds, true)): ?>
-                                <form method="post">
-                                    <input type="hidden" name="action" value="join_competition">
-                                    <input type="hidden" name="competition_id" value="<?= (int)$competition['id'] ?>">
-                                    <button type="submit" class="secondary">Beitreten</button>
-                                </form>
-                                <?php else: ?>
-                                    <span class="pill friend">Beigetreten</span>
-                                <?php endif; ?>
-                            </div>
-                        </li>
-                    <?php endforeach; ?>
-                </ul>
-            <?php endif; ?>
-        </section>
-
-        <section class="card wide">
-            <?php if (!$selectedCompetition): ?>
-                <h2>Auswertung</h2>
-                <p>Waehle bei einem Wettkampf den Button Auswertung, um Statistik, Rangliste und Turnier-Matchings zu sehen.</p>
-            <?php else: ?>
-                <h2>Auswertung: <?= esc($selectedCompetition['name']) ?></h2>
-                <p class="stat-hint">Status: <?= esc($selectedCompetition['status']) ?> | Start: <?= esc($selectedCompetition['start_date']) ?></p>
-
-                <h3>Rangliste im Wettkampf</h3>
-                <?php if (count($selectedCompetitionLeaderboard) === 0): ?>
-                    <p>Keine Ranglistendaten vorhanden.</p>
-                <?php else: ?>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>#</th>
-                                <th>Spieler</th>
-                                <th>Punkte</th>
-                                <th>Siege</th>
-                                <th>Niederlagen</th>
-                                <th>Spiele</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php foreach ($selectedCompetitionLeaderboard as $idx => $row): ?>
-                                <tr>
-                                    <td><?= $idx + 1 ?></td>
-                                    <td><?= esc($row['username']) ?></td>
-                                    <td><?= (int)$row['points'] ?></td>
-                                    <td><?= (int)$row['wins'] ?></td>
-                                    <td><?= (int)$row['losses'] ?></td>
-                                    <td><?= (int)$row['games_played'] ?></td>
-                                </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                <?php endif; ?>
-
-                <h3>Teilnehmer</h3>
-                <?php if (count($selectedCompetitionParticipants) === 0): ?>
-                    <p>Noch keine Teilnehmer eingetragen.</p>
-                <?php else: ?>
-                    <ul class="item-list avatar-list">
-                        <?php foreach ($selectedCompetitionParticipants as $participant): ?>
-                            <li>
-                                <div class="avatar-row">
-                                    <img class="avatar" src="<?= esc(avatarUrl($participant['avatar_path'] ?? null)) ?>" alt="Avatar von <?= esc($participant['username']) ?>">
-                                    <strong><?= esc($participant['username']) ?></strong>
-                                </div>
-                            </li>
-                        <?php endforeach; ?>
-                    </ul>
-                <?php endif; ?>
-
-                <h3>Letzte Wettkampfspiele</h3>
-                <?php if (count($selectedCompetitionGames) === 0): ?>
-                    <p>Noch keine Spiele fuer diesen Wettkampf.</p>
-                <?php else: ?>
-                    <ul class="item-list">
-                        <?php foreach ($selectedCompetitionGames as $game): ?>
-                            <li>
-                                <div>
-                                    <strong><?= esc($game['p1']) ?> <?= (int)$game['score_player1'] ?> : <?= (int)$game['score_player2'] ?> <?= esc($game['p2']) ?></strong>
-                                    <small>Status: <?= esc($game['status']) ?> | Sieger: <?= esc($game['winner_name'] ?? '-') ?></small>
-                                </div>
-                            </li>
-                        <?php endforeach; ?>
-                    </ul>
-                <?php endif; ?>
-
-                <h3>Turnier-Matchings (Vorschlag)</h3>
-                <?php if (count($roundRobinPairings) === 0): ?>
-                    <p>Fuer Matchings werden mindestens 2 Teilnehmer benoetigt.</p>
-                <?php else: ?>
-                    <ul class="item-list compact-list">
-                        <?php foreach (array_slice($roundRobinPairings, 0, 20) as $pairing): ?>
-                            <li>
-                                <strong><?= esc($pairing['a']) ?> vs <?= esc($pairing['b']) ?></strong>
-                            </li>
-                        <?php endforeach; ?>
-                    </ul>
-                    <?php if (count($roundRobinPairings) > 20): ?>
-                        <p class="stat-hint">+<?= count($roundRobinPairings) - 20 ?> weitere Paarungen.</p>
-                    <?php endif; ?>
-                <?php endif; ?>
-
-                <h3>KO-Phase (Halbfinale/Finale Vorschlag)</h3>
-                <?php if (count($semiFinalPairings) < 2): ?>
-                    <p>Fuer Halbfinale werden mindestens 4 Spieler mit Rangliste benoetigt.</p>
-                <?php else: ?>
-                    <ul class="item-list compact-list">
-                        <?php foreach ($semiFinalPairings as $semi): ?>
-                            <li>
-                                <strong><?= esc($semi['label']) ?>:</strong>
-                                <span><?= esc($semi['a']) ?> vs <?= esc($semi['b']) ?></span>
-                            </li>
-                        <?php endforeach; ?>
-                        <?php if ($finalSuggestion): ?>
-                            <li>
-                                <strong>Finale:</strong>
-                                <span><?= esc($finalSuggestion) ?></span>
-                            </li>
-                        <?php endif; ?>
-                    </ul>
-                <?php endif; ?>
-            <?php endif; ?>
-        </section>
-        <?php endif; ?>
-
-        <?php if ($page === 'matches' && $loggedIn): ?>
-        <section class="card">
-            <h2>Letzte Spiele</h2>
-            <?php if (count($recentGames) === 0): ?>
-                <p>Es wurden noch keine Spiele eingetragen.</p>
-            <?php else: ?>
-                <ul class="item-list">
-                    <?php foreach ($recentGames as $game): ?>
-                        <li>
-                            <div>
-                                <strong><?= esc($game['p1']) ?> <?= (int)$game['score_player1'] ?> : <?= (int)$game['score_player2'] ?> <?= esc($game['p2']) ?></strong>
-                                <small>Status: <?= esc($game['status']) ?> | Sieger: <?= esc($game['winner_name'] ?? '-') ?><?= $game['competition_name'] ? ' | ' . esc($game['competition_name']) : '' ?></small>
-                            </div>
-                        </li>
-                    <?php endforeach; ?>
-                </ul>
-            <?php endif; ?>
-        </section>
-        <?php endif; ?>
-
-        <?php if ($page === 'friends' && $loggedIn): ?>
-        <section class="card">
-            <h2>Freunde</h2>
-            <?php if (count($friends) === 0): ?>
-                <p>Du hast noch keine bestaetigten Freunde.</p>
-            <?php else: ?>
-                <ul class="item-list avatar-list">
-                    <?php foreach ($friends as $friend): ?>
-                        <li>
-                            <div class="avatar-row">
-                                <img class="avatar" src="<?= esc(avatarUrl($friend['avatar_path'] ?? null)) ?>" alt="Avatar von <?= esc($friend['username']) ?>">
-                                <div>
-                                    <strong><?= esc($friend['username']) ?></strong>
-                                    <small>Befreundet</small>
-                                </div>
-                            </div>
-                            <form method="post">
-                                <input type="hidden" name="action" value="remove_friend">
-                                <input type="hidden" name="friend_id" value="<?= (int)$friend['id'] ?>">
-                                <button type="submit" class="secondary">Entfernen</button>
-                            </form>
-                        </li>
-                    <?php endforeach; ?>
-                </ul>
-            <?php endif; ?>
-        </section>
-
-        <section class="card">
-            <h2>Freundesanfragen erhalten</h2>
-            <?php if (count($incomingFriendRequests) === 0): ?>
-                <p>Keine offenen Anfragen.</p>
-            <?php else: ?>
-                <ul class="item-list avatar-list">
-                    <?php foreach ($incomingFriendRequests as $request): ?>
-                        <li>
-                            <div class="avatar-row">
-                                <img class="avatar" src="<?= esc(avatarUrl($request['avatar_path'] ?? null)) ?>" alt="Avatar von <?= esc($request['username']) ?>">
-                                <div>
-                                    <strong><?= esc($request['username']) ?></strong>
-                                    <small>moechte dein Freund werden</small>
-                                </div>
-                            </div>
-                            <div class="inline-actions">
-                                <form method="post">
-                                    <input type="hidden" name="action" value="accept_friend_request">
-                                    <input type="hidden" name="friendship_id" value="<?= (int)$request['id'] ?>">
-                                    <button type="submit">Annehmen</button>
-                                </form>
-                                <form method="post">
-                                    <input type="hidden" name="action" value="reject_friend_request">
-                                    <input type="hidden" name="friendship_id" value="<?= (int)$request['id'] ?>">
-                                    <button type="submit" class="secondary">Ablehnen</button>
-                                </form>
-                            </div>
-                        </li>
-                    <?php endforeach; ?>
-                </ul>
-            <?php endif; ?>
-        </section>
-
-        <section class="card wide">
-            <h2>Spieler finden</h2>
-            <?php if (count($friendSuggestions) === 0): ?>
-                <p>Aktuell keine neuen Vorschlaege verfuegbar.</p>
-            <?php else: ?>
-                <ul class="item-list avatar-list">
-                    <?php foreach ($friendSuggestions as $suggestion): ?>
-                        <li>
-                            <div class="avatar-row">
-                                <img class="avatar" src="<?= esc(avatarUrl($suggestion['avatar_path'] ?? null)) ?>" alt="Avatar von <?= esc($suggestion['username']) ?>">
-                                <div>
-                                    <strong><?= esc($suggestion['username']) ?></strong>
-                                    <small>Spielerprofil</small>
-                                </div>
-                            </div>
-                            <form method="post">
-                                <input type="hidden" name="action" value="send_friend_request">
-                                <input type="hidden" name="target_user_id" value="<?= (int)$suggestion['id'] ?>">
-                                <button type="submit">Anfrage senden</button>
-                            </form>
-                        </li>
-                    <?php endforeach; ?>
-                </ul>
-            <?php endif; ?>
-            <?php if (count($outgoingFriendRequests) > 0): ?>
-                <h3>Gesendete Anfragen</h3>
-                <ul class="item-list avatar-list">
-                    <?php foreach ($outgoingFriendRequests as $request): ?>
-                        <li>
-                            <div class="avatar-row">
-                                <img class="avatar" src="<?= esc(avatarUrl($request['avatar_path'] ?? null)) ?>" alt="Avatar von <?= esc($request['username']) ?>">
-                                <div>
-                                    <strong><?= esc($request['username']) ?></strong>
-                                    <small>Warte auf Antwort</small>
-                                </div>
-                            </div>
-                        </li>
-                    <?php endforeach; ?>
-                </ul>
-            <?php endif; ?>
-        </section>
-        <?php endif; ?>
-
-        <?php if ($page === 'profile' && $loggedIn): ?>
-        <section class="card">
-            <h2>Profil</h2>
-            <?php if ($currentProfile): ?>
-                <div class="profile-header">
-                    <img class="avatar avatar-large" src="<?= esc(avatarUrl($currentProfile['avatar_path'] ?? null)) ?>" alt="Profilbild">
-                    <div>
-                        <p class="stat-label">Benutzername</p>
-                        <p class="profile-value"><?= esc($currentProfile['username']) ?></p>
-                        <p class="stat-label">E-Mail</p>
-                        <p class="profile-value"><?= esc($currentProfile['email']) ?></p>
-                    </div>
-                </div>
-            <?php endif; ?>
-        </section>
-
-        <section class="card">
-            <h2>Profilbild hochladen</h2>
-            <form method="post" enctype="multipart/form-data" class="form-stack">
-                <input type="hidden" name="action" value="upload_avatar">
-                <label>Bilddatei (JPG, PNG, WEBP, GIF, max 2 MB)
-                    <input type="file" name="avatar" accept="image/jpeg,image/png,image/webp,image/gif" required>
-                </label>
-                <button type="submit">Profilbild speichern</button>
-            </form>
-        </section>
-        <?php endif; ?>
+        <?php require __DIR__ . '/views/' . $page . '.php'; ?>
     </main>
 
     <script src="assets/js/app.js?v=<?= esc($jsVersion) ?>"></script>
 </body>
+
 </html>

@@ -7,6 +7,9 @@ require_once __DIR__ . '/helpers.php';
 
 function registerUser(string $username, string $email, string $password, string $secretCode): void
 {
+    $ip = (string)($_SERVER['REMOTE_ADDR'] ?? 'unknown');
+    checkRateLimit('register:' . $ip, 3, 600);
+
     $expectedSecret = env('REGISTER_SECRET', '');
     if ($expectedSecret === '' || !hash_equals($expectedSecret, $secretCode)) {
         throw new RuntimeException('Ungültiger Secret-Code.');
@@ -46,6 +49,9 @@ function registerUser(string $username, string $email, string $password, string 
 
 function loginUser(string $usernameOrEmail, string $password): void
 {
+    $ip = (string)($_SERVER['REMOTE_ADDR'] ?? 'unknown');
+    checkRateLimit('login:' . $ip, 10, 300);
+
     $stmt = db()->prepare('SELECT id, username, email, password_hash FROM users WHERE username = :username OR email = :email LIMIT 1');
     $stmt->execute([
         'username' => $usernameOrEmail,

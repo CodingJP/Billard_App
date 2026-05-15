@@ -84,3 +84,27 @@ self.addEventListener('fetch', (event) => {
     })
   );
 });
+
+// ─── Web Push Notifications ───────────────────────────────────────────────────
+
+self.addEventListener('push', (event) => {
+  let data = { title: 'BillardLiga', body: 'Neue Aktivität in der Liga.' };
+  try {
+    data = event.data?.json() ?? data;
+  } catch (_e) {
+    data.body = event.data?.text() ?? data.body;
+  }
+  event.waitUntil(
+    self.registration.showNotification(data.title, {
+      body: data.body,
+      icon: './assets/icons/icon-192.svg',
+      badge: './assets/icons/icon-192.svg',
+    })
+  );
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil(clients.openWindow('./'));
+});
+

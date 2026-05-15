@@ -10,6 +10,11 @@ services:
       DB_NAME: billard_app
       DB_USER: billard
       DB_PASS: billard
+      REGISTER_SECRET: geheim
+      # VAPID-Schlüssel mit "php scripts/generate-vapid-keys.php" erzeugen
+      VAPID_PUBLIC_KEY: ""
+      VAPID_PRIVATE_KEY: ""
+      VAPID_SUBJECT: "mailto:admin@billardliga.local"
     ports:
       - "8080:80"
     volumes:
